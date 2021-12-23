@@ -1,7 +1,20 @@
-import { NoWork }  from './ReactFiberExpirationTime';
+import { NoWork, msToExpirationTime, Never, Sync }  from './ReactFiberExpirationTime';
 import { ConcurrentMode } from './ReactTypeOfMode';
 import { HostRoot } from './ReactWorkTags';
 import { NoEffect, NoContext } from './ReactSideEffectTag';
+import { UpdateState } from './ReactUpdateQueue';
+
+let nextFlushedExpirationTime = NoWork; // 表示下一个要被执行render的fiber的expitationTime
+let isWorking = false; // 表示正在工作阶段 render阶段端和commit阶段都是working阶段
+let isCommitting = false; // 表示现在是否提交阶段
+let nextRenderExpirationTime = NoWork; // 表示正在执行render的过程中 可以允许执行render的最大时间 在这个时间内都可以中断 超过了就不能中断了
+let isRendering = false; // 表示正在render阶段 也就是创建或者更新fiber树阶段
+
+// 用来记录react应用最初执行时间以及计算
+let originalStartTimeMs = performance.now();
+let currentRenderTime = msToExpirationTime(originalStartTimeMs);
+let currentSchedulerTime = currentRenderTime;
+let expirationContext = NoWork;
 
 
 /**
@@ -70,6 +83,71 @@ class FiberNode {
     }
 }
 
+/**
+ * 计算当前时间
+ */
+function requestCurrentTime() {
+    if(isRendering) {
+        // 已经开始渲染的话 那么返回最近计算出来的时间
+        return currentSchedulerTime;
+    };
+
+    if(nextFlushedExpirationTime === NoWork || nextFlushedExpirationTime === Never) {
+        currentSchedulerTime = currentRenderTime = msToExpirationTime(performance.now() - originalStartTimeMs);
+    }
+    return currentSchedulerTime;
+}
+
+function computeExpirationForFiber(currentTime, fiber) {
+    let expirationTime = null;
+    if(expirationContext !== NoWork) {
+        // 当通过SyncUpdates把任务强制变成为最高优先级的时候走这里
+        expirationTime = expirationContext;
+    } else if(isWorking) {
+        if(isCommitting) {
+            // commit 阶段
+            // 在提交阶段也就是全部的fiber都已经构建完成之后
+            // 要把更新真实渲染到dom上去 这个过程是不能中断的
+            // 所以要直接让他变成同步的
+            expirationTime = Sync;
+        } else {
+            // render 阶段
+                // 进入这里说明可能是刚才有个异步的任务被中断了
+                // 然后现在要重新回来执行刚才那个被中断的任务
+            expirationTime = nextRenderExpirationTime;
+        }
+    } else {
+        // &是用来看这个mode上是否被添加过ConcurrentMode这个东西
+        // 只有当给组件包裹了 <ConcurrentMode></ConcurrentMode> 的时候
+        // 才会进入这个逻辑 表示该组件下的所有更新任务都要以低优先级的异步方式更新
+        if(fiber.mode && ConcurrentMode) {
+            // TODO 这逻辑先用不到 先不写
+        } else {
+            // 如果即不是异步也不批量也不是在正在更新fiber树的途中的话
+            // 就直接让这个expirationTime变为同步的Sync
+            expirationTime = Sync
+        }
+    }
+    return expirationTime;
+}
+/*    --------更新任务队列相关------------   */
+function createUpdate(expirationTime) {
+    return {
+        expirationTime, // 当前更新的优先级
+        tag: UpdateState, // tag表示这个更新的类型
+        payload: null, // 初次渲染时表示要更新的元素 执行setState时 它是传进来的新的state
+        callback: null,
+        next: null,
+        nextEffect: null, // 下一个update对应的fiber
+    }
+}
+
+function enqueueUpdate(fiber, update) {
+    // TODO
+    debugger;
+}
+
+
 class ReactRoot {
     constructor(container, isConcurrent) {
         this._internalRoot = this.createFiberRoot(container, isConcurrent);
@@ -108,7 +186,7 @@ class ReactRoot {
         // 让 container上可以指向RootFiber, 
         return root;
     }
-
+    
     createHostRootFiber = (isConcurrent) => {
         // 第一次渲染肯定是false
         // 第一次的mode肯定是同步模式
@@ -119,8 +197,52 @@ class ReactRoot {
         return createFiber(HostRoot, null, null, mode);
     }
 
+    updateContainer = (element, container, parentComponent, callback) => {
+        // 这里在初次渲染的时候 element为children, container为 root, parentComponent为 null 
+        let current = container.current; // FiberRoot
+        let currentTime = requestCurrentTime();
+        let expirationTime = computeExpirationForFiber(currentTime, current);
+        this.scheduleRootUpdate(current, element, expirationTime, callback);
+    }
+
+    scheduleRootUpdate = (current, element, expirationTime, callback) => {
+        let update = createUpdate(expirationTime);
+        // payload应该是表示要更新的新的状态
+        // 不过初次渲染的时候这个payload是根组件
+        update.payload = { element };
+        update.callback = callback;
+
+        // enqueueUpdate是用来更新该fiber上的任务队列的
+        // 初次渲染的时候即使要把根组件更新到RootFiber上
+        enqueueUpdate(current, update);
+
+    }
+
     render(children, callback) {
-        // TODO render
+        let root = this._internalRoot;
+        let work = new ReactWork();
+        if(!!callback) {
+            work.then(callback)
+        };
+        
+        this.updateContainer(children, root, null, work._onCommit)
+    }
+}
+
+class ReactWork {
+    _callbacks = [];
+    _didCommit = false;
+    _onCommit = this._onCommit.bind(this);
+    then(callback) {
+        if(typeof callback === 'function') {
+            this._callbacks.push(callback);
+        };
+    };
+    _onCommit() {
+        if(this._didCommit) return;
+        this._callbacks.forEach((item) => {
+            item();
+        }) 
     }
 }
 
